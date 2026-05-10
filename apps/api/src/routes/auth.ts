@@ -35,27 +35,18 @@ authRouter.post("/signup", asyncHandler(async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
 
   const existing = await prisma.user.findUnique({ where: { email: parsed.data.email } });
-  if (existing?.passwordHash) {
+  if (existing) {
     return res.status(409).json({ error: "email_already_registered" });
   }
 
-  const user = existing
-    ? await prisma.user.update({
-        where: { id: existing.id },
-        data: {
-          name: parsed.data.name,
-          location: parsed.data.location,
-          passwordHash: hashPassword(parsed.data.password),
-        },
-      })
-    : await prisma.user.create({
-        data: {
-          name: parsed.data.name,
-          email: parsed.data.email,
-          location: parsed.data.location,
-          passwordHash: hashPassword(parsed.data.password),
-        },
-      });
+  const user = await prisma.user.create({
+    data: {
+      name: parsed.data.name,
+      email: parsed.data.email,
+      location: parsed.data.location,
+      passwordHash: hashPassword(parsed.data.password),
+    },
+  });
 
   await createSession(res, user.id);
 

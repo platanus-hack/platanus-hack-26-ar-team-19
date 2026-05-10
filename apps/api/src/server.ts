@@ -47,7 +47,7 @@ export const createServer = (): Express => {
 
   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
     log("ERROR", err.message, err.stack);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: "internal_error" });
   });
 
   return app;
