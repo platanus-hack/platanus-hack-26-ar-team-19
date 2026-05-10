@@ -7,7 +7,9 @@ import path from "path";
 const openAiApiKey = process.env.OPENAI_API_KEY;
 const geminiApiKey = process.env.GEMINI_API_KEY;
 const openAiVisionModel = process.env.OPENAI_VISION_MODEL ?? "gpt-4o-mini";
-const IMAGE_FETCH_TIMEOUT_MS = Number(process.env.VISION_IMAGE_FETCH_TIMEOUT_MS ?? 15_000);
+const uploadsRoot = process.cwd().endsWith(`${path.sep}apps${path.sep}api`)
+  ? path.resolve(process.cwd(), "../public/uploads")
+  : path.resolve(process.cwd(), "apps/public/uploads");
 
 const openAiClient = new OpenAI({ apiKey: openAiApiKey ?? "missing" });
 const geminiClient = new GoogleGenerativeAI(geminiApiKey ?? "missing");
@@ -46,41 +48,32 @@ Respond ONLY with JSON: {"matches": true/false, "confidence": 0.0-1.0, "reason":
 
 function resolveImagePath(imageUrl: string): string {
   if (imageUrl.startsWith("/uploads/")) {
-    return path.resolve(__dirname, "../../public", imageUrl.slice(1));
+    const filename = imageUrl.slice("/uploads/".length);
+    const resolved = path.resolve(uploadsRoot, filename);
+    if (path.basename(filename) !== filename || !resolved.startsWith(`${uploadsRoot}${path.sep}`)) {
+      throw new Error("invalid_image_url");
+    }
+    return resolved;
   }
-  return imageUrl;
+  if (imageUrl.startsWith("data:image/")) return imageUrl;
+  throw new Error("invalid_image_url");
 }
 
-async function fetchImageAsDataUrl(imageUrl: string): Promise<string> {
-  const res = await fetch(imageUrl, {
-    signal: AbortSignal.timeout(IMAGE_FETCH_TIMEOUT_MS),
-    headers: {
-      Accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-      Referer: "https://www.facebook.com/",
-      "User-Agent":
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    },
-  });
-  if (!res.ok) {
-    throw new Error(`image fetch failed: ${res.status} ${res.statusText}`);
-  }
-
-  const contentType = res.headers.get("content-type") ?? "image/jpeg";
-  const buffer = Buffer.from(await res.arrayBuffer());
-  return `data:${contentType};base64,${buffer.toString("base64")}`;
+function isResolvedUploadPath(imageUrl: string): boolean {
+  return imageUrl.startsWith(`${uploadsRoot}${path.sep}`);
 }
 
 async function buildOpenAiImageContent(imageUrl: string): Promise<OpenAI.ChatCompletionContentPartImage> {
   if (imageUrl.startsWith("data:")) {
     return { type: "image_url", image_url: { url: imageUrl, detail: "low" } };
   }
-  if (imageUrl.startsWith("/") || imageUrl.startsWith("./")) {
+  if (isResolvedUploadPath(imageUrl)) {
     const buffer = readFileSync(imageUrl);
     const base64 = buffer.toString("base64");
     const mime = imageUrl.endsWith(".png") ? "image/png" : "image/jpeg";
     return { type: "image_url", image_url: { url: `data:${mime};base64,${base64}`, detail: "low" } };
   }
-  return { type: "image_url", image_url: { url: await fetchImageAsDataUrl(imageUrl), detail: "low" } };
+  throw new Error("invalid_image_url");
 }
 
 async function analyzeWithOpenAi(imageUrl: string, prompt: string, maxTokens = 500): Promise<string> {
@@ -110,15 +103,12 @@ async function analyzeWithGemini(imageUrl: string, prompt: string): Promise<stri
     const [header, data] = imageUrl.split(",");
     const mimeType = header?.match(/data:(.*);/)?.[1] ?? "image/jpeg";
     imagePart = { inlineData: { data: data!, mimeType } };
-  } else if (imageUrl.startsWith("/") || imageUrl.startsWith("./")) {
+  } else if (isResolvedUploadPath(imageUrl)) {
     const buffer = readFileSync(imageUrl);
     const mime = imageUrl.endsWith(".png") ? "image/png" : "image/jpeg";
     imagePart = { inlineData: { data: buffer.toString("base64"), mimeType: mime } };
   } else {
-    const res = await fetch(imageUrl);
-    const buffer = Buffer.from(await res.arrayBuffer());
-    const mime = res.headers.get("content-type") ?? "image/jpeg";
-    imagePart = { inlineData: { data: buffer.toString("base64"), mimeType: mime } };
+    throw new Error("invalid_image_url");
   }
 
   const result = await model.generateContent([prompt, imagePart]);

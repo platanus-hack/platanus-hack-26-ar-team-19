@@ -26,9 +26,9 @@ export async function tryAutoPay(
     return false;
   }
 
-  if (buyer.autoPayCategories.length > 0 && category) {
-    if (!buyer.autoPayCategories.includes(category)) {
-      log(`[auto-pay] Category "${category}" not in allowed: ${buyer.autoPayCategories.join(", ")}`);
+  if (buyer.autoPayCategories.length > 0) {
+    if (!category || !buyer.autoPayCategories.includes(category)) {
+      log(`[auto-pay] Category "${category ?? "uncategorized"}" not in allowed: ${buyer.autoPayCategories.join(", ")}`);
       return false;
     }
   }

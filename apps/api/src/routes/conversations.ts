@@ -507,7 +507,8 @@ conversationsRouter.post("/:id/messages/stream", asyncHandler(async (req, res) =
       ...completion,
     });
   } catch (err) {
-    sseSend(res, { error: (err as Error).message });
+    log("Streaming conversation failed:", (err as Error).message);
+    sseSend(res, { error: "internal_error" });
   }
   res.end();
 }));

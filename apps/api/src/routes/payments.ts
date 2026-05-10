@@ -1,8 +1,9 @@
 import { Router, type Router as RouterType } from "express";
 import prisma from "@repo/db";
+import { log } from "@repo/logger";
 import { requireAuth, type AuthUser } from "../auth";
 import { MercadoPagoConfig, Preference, Payment } from "mercadopago";
-import { randomBytes } from "crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 
 export const paymentsRouter: RouterType = Router();
 
@@ -14,6 +15,7 @@ const mpAppId = process.env.MP_APP_ID ?? "";
 const mpClientSecret = process.env.MP_CLIENT_SECRET ?? "";
 const webOrigin = process.env.WEB_ORIGIN ?? "http://localhost:3000";
 const apiPublicUrl = process.env.API_PUBLIC_URL ?? `http://localhost:${process.env.PORT ?? 4000}`;
+const MP_OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
 
 function getMpClient() {
   return new MercadoPagoConfig({ accessToken: mpAccessToken });
@@ -21,6 +23,50 @@ function getMpClient() {
 
 function generateVerificationCode(): string {
   return randomBytes(3).toString("hex").toUpperCase();
+}
+
+function stateSecret(): string {
+  return process.env.MP_OAUTH_STATE_SECRET || mpClientSecret || mpAccessToken;
+}
+
+function signState(payload: string): string {
+  return createHmac("sha256", stateSecret()).update(payload).digest("base64url");
+}
+
+function createMpOAuthState(userId: string): string {
+  const payload = Buffer.from(JSON.stringify({
+    userId,
+    ts: Date.now(),
+    nonce: randomBytes(16).toString("base64url"),
+  })).toString("base64url");
+  return `${payload}.${signState(payload)}`;
+}
+
+function verifyMpOAuthState(state: string): string | null {
+  const [payload, signature] = state.split(".");
+  if (!payload || !signature || !stateSecret()) return null;
+
+  const expected = signState(payload);
+  const actualBuffer = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expected);
+  if (
+    actualBuffer.length !== expectedBuffer.length ||
+    !timingSafeEqual(actualBuffer, expectedBuffer)
+  ) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as {
+      userId?: unknown;
+      ts?: unknown;
+    };
+    if (typeof parsed.userId !== "string" || typeof parsed.ts !== "number") return null;
+    if (Date.now() - parsed.ts > MP_OAUTH_STATE_TTL_MS) return null;
+    return parsed.userId;
+  } catch {
+    return null;
+  }
 }
 
 // --- Checkout Pro preference (manual payment fallback) ---
@@ -90,7 +136,8 @@ paymentsRouter.post("/create-preference", requireAuth, async (req, res) => {
     const result = await createPaymentPreference(negotiationId);
     return res.json(result);
   } catch (err) {
-    return res.status(500).json({ error: (err as Error).message });
+    log("Create payment preference error:", (err as Error).message);
+    return res.status(500).json({ error: "payment_unavailable" });
   }
 });
 
@@ -134,7 +181,7 @@ paymentsRouter.post("/webhook", async (req, res) => {
       });
     }
   } catch (err) {
-    console.error("Webhook processing error:", err);
+    log("Webhook processing error:", (err as Error).message);
   }
 });
 
@@ -215,14 +262,16 @@ paymentsRouter.get("/auto-pay-settings", requireAuth, async (req, res) => {
 paymentsRouter.get("/mp/connect", requireAuth, async (_req, res) => {
   const user = res.locals.user as AuthUser;
   if (!mpAppId) return res.status(500).json({ error: "MP_APP_ID not configured" });
+  if (!stateSecret()) return res.status(500).json({ error: "MP OAuth state secret not configured" });
 
   const redirectUri = `${apiPublicUrl}/payments/mp/callback`;
+  const state = createMpOAuthState(user.id);
   const authUrl =
     `https://auth.mercadopago.com.pe/authorization` +
     `?client_id=${mpAppId}` +
     `&response_type=code` +
     `&platform_id=mp` +
-    `&state=${user.id}` +
+    `&state=${encodeURIComponent(state)}` +
     `&redirect_uri=${encodeURIComponent(redirectUri)}`;
 
   return res.json({ url: authUrl });
@@ -230,8 +279,11 @@ paymentsRouter.get("/mp/connect", requireAuth, async (_req, res) => {
 
 // GET /payments/mp/callback — MP redirects here after OAuth
 paymentsRouter.get("/mp/callback", async (req, res) => {
-  const { code, state: userId } = req.query as { code?: string; state?: string };
-  if (!code || !userId) return res.redirect(`${webOrigin}/onboarding?mp=error`);
+  const { code, state } = req.query as { code?: string; state?: string };
+  if (!code || !state) return res.redirect(`${webOrigin}/onboarding?mp=error`);
+
+  const userId = verifyMpOAuthState(state);
+  if (!userId) return res.redirect(`${webOrigin}/onboarding?mp=error`);
 
   try {
     const tokenRes = await fetch("https://api.mercadopago.com/oauth/token", {
@@ -247,7 +299,7 @@ paymentsRouter.get("/mp/callback", async (req, res) => {
     });
 
     if (!tokenRes.ok) {
-      console.error("MP OAuth token exchange failed:", await tokenRes.text());
+      log("MP OAuth token exchange failed");
       return res.redirect(`${webOrigin}/onboarding?mp=error`);
     }
 
@@ -271,7 +323,7 @@ paymentsRouter.get("/mp/callback", async (req, res) => {
 
     return res.redirect(`${webOrigin}/onboarding?mp=ok`);
   } catch (err) {
-    console.error("MP OAuth error:", err);
+    log("MP OAuth error:", (err as Error).message);
     return res.redirect(`${webOrigin}/onboarding?mp=error`);
   }
 });
@@ -340,8 +392,8 @@ paymentsRouter.post("/mp/save-card", requireAuth, async (req, res) => {
     });
 
     if (!cardRes.ok) {
-      const errText = await cardRes.text();
-      return res.status(500).json({ error: "Failed to save card: " + errText });
+      log("Failed to save MP card");
+      return res.status(500).json({ error: "failed_to_save_card" });
     }
 
     const cardData = (await cardRes.json()) as { id: string; last_four_digits: string };
@@ -353,7 +405,7 @@ paymentsRouter.post("/mp/save-card", requireAuth, async (req, res) => {
 
     return res.json({ ok: true, lastFour: cardData.last_four_digits });
   } catch (err) {
-    console.error("Save card error:", err);
-    return res.status(500).json({ error: (err as Error).message });
+    log("Save card error:", (err as Error).message);
+    return res.status(500).json({ error: "failed_to_save_card" });
   }
 });
