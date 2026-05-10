@@ -218,7 +218,7 @@ paymentsRouter.get("/mp/connect", requireAuth, async (_req, res) => {
 
   const redirectUri = `${apiPublicUrl}/payments/mp/callback`;
   const authUrl =
-    `https://auth.mercadopago.com.pe/authorization` +
+    `https://auth.mercadopago.com.ar/authorization` +
     `?client_id=${mpAppId}` +
     `&response_type=code` +
     `&platform_id=mp` +
