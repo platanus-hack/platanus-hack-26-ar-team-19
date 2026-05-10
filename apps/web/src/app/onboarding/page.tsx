@@ -2,10 +2,9 @@
 
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
-import { saveCard, getMe } from "@/lib/api";
+import { getMe } from "@/lib/api";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:4000";
-const MP_PUBLIC_KEY = process.env.NEXT_PUBLIC_MP_PUBLIC_KEY || "";
 
 const COUNTRIES = [
   { code: "AR", name: "Argentina", flag: "\u{1F1E6}\u{1F1F7}" },
@@ -17,45 +16,19 @@ const COUNTRIES = [
   { code: "UY", name: "Uruguay", flag: "\u{1F1FA}\u{1F1FE}" },
 ];
 
-type Step = "country" | "mercadopago" | "card" | "ready";
-
-declare global {
-  interface Window {
-    MercadoPago: new (key: string) => {
-      createCardToken: (data: {
-        cardNumber: string;
-        cardholderName: string;
-        cardExpirationMonth: string;
-        cardExpirationYear: string;
-        securityCode: string;
-        identificationType: string;
-        identificationNumber: string;
-      }) => Promise<{ id: string }>;
-    };
-  }
-}
+type Step = "country" | "mercadopago" | "location" | "ready";
 
 export default function OnboardingPage() {
   const [step, setStep] = useState<Step>("country");
   const [selectedCountry, setSelectedCountry] = useState<string | null>(null);
   const [mpConnected, setMpConnected] = useState(false);
   const [mpLoading, setMpLoading] = useState(false);
-  const [cardSaved, setCardSaved] = useState(false);
-  const [cardLastFour, setCardLastFour] = useState("");
-  const [cardLoading, setCardLoading] = useState(false);
-  const [cardError, setCardError] = useState("");
-  const [cardForm, setCardForm] = useState({
-    number: "",
-    name: "",
-    expMonth: "",
-    expYear: "",
-    cvv: "",
-    docType: "DNI",
-    docNumber: "",
-  });
+  const [locationLoading, setLocationLoading] = useState(false);
+  const [locationAddress, setLocationAddress] = useState("");
+  const [locationError, setLocationError] = useState("");
+  const [locationCoords, setLocationCoords] = useState<{ lat: number; lng: number } | null>(null);
   const router = useRouter();
 
-  // Detect state from DB + OAuth callback params
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const mpResult = params.get("mp");
@@ -67,7 +40,7 @@ export default function OnboardingPage() {
       }
       if (mpResult === "ok" || user.mpConnected) {
         setMpConnected(true);
-        setStep("card");
+        setStep("location");
       } else if (mpResult === "error") {
         setStep("mercadopago");
       }
@@ -78,16 +51,6 @@ export default function OnboardingPage() {
       router.replace("/login");
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Load MercadoPago.js SDK
-  useEffect(() => {
-    if (document.getElementById("mp-sdk")) return;
-    const script = document.createElement("script");
-    script.id = "mp-sdk";
-    script.src = "https://sdk.mercadopago.com/js/v2";
-    script.async = true;
-    document.body.appendChild(script);
   }, []);
 
   async function connectMP() {
@@ -103,28 +66,37 @@ export default function OnboardingPage() {
     }
   }
 
-  async function handleSaveCard() {
-    setCardLoading(true);
-    setCardError("");
+  async function detectLocation() {
+    setLocationLoading(true);
+    setLocationError("");
     try {
-      if (!window.MercadoPago) throw new Error("MercadoPago SDK not loaded");
-      const mp = new window.MercadoPago(MP_PUBLIC_KEY);
-      const token = await mp.createCardToken({
-        cardNumber: cardForm.number.replace(/\s/g, ""),
-        cardholderName: cardForm.name,
-        cardExpirationMonth: cardForm.expMonth,
-        cardExpirationYear: cardForm.expYear,
-        securityCode: cardForm.cvv,
-        identificationType: cardForm.docType,
-        identificationNumber: cardForm.docNumber,
+      const pos = await new Promise<GeolocationPosition>((resolve, reject) => {
+        navigator.geolocation.getCurrentPosition(resolve, reject, {
+          enableHighAccuracy: true,
+          timeout: 10000,
+        });
       });
-      const result = await saveCard(token.id);
-      setCardSaved(true);
-      setCardLastFour(result.lastFour);
-    } catch (err) {
-      setCardError((err as Error).message || "Error al guardar la tarjeta");
+      const { latitude, longitude } = pos.coords;
+      setLocationCoords({ lat: latitude, lng: longitude });
+
+      const res = await fetch(
+        `https://nominatim.openstreetmap.org/reverse?lat=${latitude}&lon=${longitude}&format=json&addressdetails=1`,
+        { headers: { "User-Agent": "negocIA-marketplace" } },
+      );
+      const data = await res.json();
+      const addr = data.address;
+      const parts = [
+        addr?.road,
+        addr?.house_number,
+        addr?.suburb || addr?.neighbourhood,
+        addr?.city || addr?.town || addr?.village,
+        addr?.state,
+      ].filter(Boolean);
+      setLocationAddress(parts.join(", ") || `${latitude.toFixed(4)}, ${longitude.toFixed(4)}`);
+    } catch {
+      setLocationError("No pudimos acceder a tu ubicacion. Escribila manualmente.");
     } finally {
-      setCardLoading(false);
+      setLocationLoading(false);
     }
   }
 
@@ -138,13 +110,13 @@ export default function OnboardingPage() {
       <div className="w-full max-w-lg">
         {/* Progress */}
         <div className="flex items-center gap-2 mb-10">
-          {["country", "mercadopago", "card", "ready"].map((s, i) => (
+          {["country", "mercadopago", "location", "ready"].map((s, i) => (
             <div key={s} className="flex items-center gap-2 flex-1">
               <div
                 className={`h-1.5 rounded-full flex-1 transition-colors ${
                   (step === "country" && i === 0) ||
                   (step === "mercadopago" && i <= 1) ||
-                  (step === "card" && i <= 2) ||
+                  (step === "location" && i <= 2) ||
                   (step === "ready" && i <= 3)
                     ? "bg-primary"
                     : "bg-border"
@@ -158,10 +130,10 @@ export default function OnboardingPage() {
         {step === "country" && (
           <div>
             <h1 className="text-3xl mb-2 tracking-tight" style={{ fontFamily: "var(--font-heading)", fontStyle: "italic" }}>
-              Dónde estás?
+              Donde estas?
             </h1>
             <p className="text-muted-foreground text-sm mb-8">
-              Elegí tu país para mostrarte productos y precios relevantes.
+              Elegi tu pais para mostrarte productos y precios relevantes.
             </p>
             <div className="grid grid-cols-2 gap-3 mb-8">
               {COUNTRIES.map((country) => (
@@ -193,10 +165,10 @@ export default function OnboardingPage() {
         {step === "mercadopago" && (
           <div>
             <h1 className="text-3xl mb-2 tracking-tight" style={{ fontFamily: "var(--font-heading)", fontStyle: "italic" }}>
-              Conectá Mercado Pago
+              Conecta Mercado Pago
             </h1>
             <p className="text-muted-foreground text-sm mb-8">
-              Vinculá tu cuenta para que tu agente pueda cobrar y pagar automáticamente.
+              Vincula tu cuenta para que tu agente pueda cobrar y pagar automaticamente.
             </p>
             <div className="rounded-lg border border-border p-6 mb-6">
               <div className="flex items-center gap-4 mb-5">
@@ -209,22 +181,22 @@ export default function OnboardingPage() {
                 </div>
                 {mpConnected && (
                   <div className="ml-auto w-6 h-6 rounded-full bg-accent flex items-center justify-center">
-                    <span className="text-accent-foreground text-xs font-bold">✓</span>
+                    <span className="text-accent-foreground text-xs font-bold">&#10003;</span>
                   </div>
                 )}
               </div>
               {!mpConnected && (
                 <div className="space-y-3">
                   <div className="flex items-start gap-3 text-sm text-muted-foreground">
-                    <span className="text-primary mt-0.5">→</span>
-                    <span>Tu agente podrá pagar automáticamente cuando cierre un trato</span>
+                    <span className="text-primary mt-0.5">&#8594;</span>
+                    <span>Tu agente podra pagar automaticamente cuando cierre un trato</span>
                   </div>
                   <div className="flex items-start gap-3 text-sm text-muted-foreground">
-                    <span className="text-primary mt-0.5">→</span>
-                    <span>Recibí pagos cuando alguien compre tus productos</span>
+                    <span className="text-primary mt-0.5">&#8594;</span>
+                    <span>Recibi pagos cuando alguien compre tus productos</span>
                   </div>
                   <div className="flex items-start gap-3 text-sm text-muted-foreground">
-                    <span className="text-primary mt-0.5">→</span>
+                    <span className="text-primary mt-0.5">&#8594;</span>
                     <span>Tus datos financieros nunca se comparten con otros usuarios</span>
                   </div>
                 </div>
@@ -240,7 +212,7 @@ export default function OnboardingPage() {
                   {mpLoading ? "Redirigiendo..." : "Conectar con Mercado Pago"}
                 </button>
                 <button
-                  onClick={() => setStep("card")}
+                  onClick={() => setStep("location")}
                   className="w-full h-11 text-muted-foreground text-sm hover:text-foreground transition-colors"
                 >
                   Omitir por ahora
@@ -248,7 +220,7 @@ export default function OnboardingPage() {
               </div>
             ) : (
               <button
-                onClick={() => setStep("card")}
+                onClick={() => setStep("location")}
                 className="w-full h-11 bg-foreground text-background rounded-lg text-sm font-medium hover:bg-foreground/90 transition-colors"
               >
                 Continuar
@@ -257,145 +229,108 @@ export default function OnboardingPage() {
           </div>
         )}
 
-        {/* Step 3: Card tokenization */}
-        {step === "card" && (
+        {/* Step 3: Location for delivery */}
+        {step === "location" && (
           <div>
             <h1 className="text-3xl mb-2 tracking-tight" style={{ fontFamily: "var(--font-heading)", fontStyle: "italic" }}>
-              Guardá tu tarjeta
+              Tu ubicacion
             </h1>
             <p className="text-muted-foreground text-sm mb-8">
-              Para que tu agente pueda pagar automáticamente cuando cierre un trato.
+              Necesitamos saber donde estas para coordinar entregas y mostrarte productos cercanos.
             </p>
 
-            {cardSaved ? (
+            {locationCoords ? (
               <div className="rounded-lg border border-accent bg-accent/5 p-6 mb-6">
-                <div className="flex items-center gap-4">
-                  <div className="w-12 h-12 rounded-full bg-accent flex items-center justify-center">
-                    <span className="text-accent-foreground text-lg font-bold">✓</span>
+                <div className="flex items-start gap-4">
+                  <div className="w-12 h-12 rounded-full bg-accent flex items-center justify-center shrink-0">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-accent-foreground">
+                      <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z" />
+                      <circle cx="12" cy="10" r="3" />
+                    </svg>
                   </div>
-                  <div>
-                    <p className="font-semibold">Tarjeta guardada</p>
-                    <p className="text-sm text-muted-foreground">
-                      **** **** **** {cardLastFour}
-                    </p>
+                  <div className="min-w-0">
+                    <p className="font-semibold">Ubicacion detectada</p>
+                    <p className="text-sm text-muted-foreground mt-0.5 break-words">{locationAddress}</p>
                   </div>
                 </div>
               </div>
             ) : (
               <div className="space-y-4 mb-6">
-                <div>
-                  <label className="text-xs text-muted-foreground mb-1 block">Número de tarjeta</label>
-                  <input
-                    type="text"
-                    placeholder="5031 7557 3453 0604"
-                    value={cardForm.number}
-                    onChange={(e) => setCardForm({ ...cardForm, number: e.target.value })}
-                    className="w-full h-11 px-3 rounded-lg border border-border bg-background text-sm focus:outline-none focus:ring-1 focus:ring-primary"
-                    maxLength={19}
-                  />
-                </div>
-                <div>
-                  <label className="text-xs text-muted-foreground mb-1 block">Nombre del titular</label>
-                  <input
-                    type="text"
-                    placeholder="APRO"
-                    value={cardForm.name}
-                    onChange={(e) => setCardForm({ ...cardForm, name: e.target.value })}
-                    className="w-full h-11 px-3 rounded-lg border border-border bg-background text-sm focus:outline-none focus:ring-1 focus:ring-primary"
-                  />
-                </div>
-                <div className="grid grid-cols-3 gap-3">
-                  <div>
-                    <label className="text-xs text-muted-foreground mb-1 block">Mes</label>
-                    <input
-                      type="text"
-                      placeholder="11"
-                      value={cardForm.expMonth}
-                      onChange={(e) => setCardForm({ ...cardForm, expMonth: e.target.value })}
-                      className="w-full h-11 px-3 rounded-lg border border-border bg-background text-sm focus:outline-none focus:ring-1 focus:ring-primary"
-                      maxLength={2}
-                    />
-                  </div>
-                  <div>
-                    <label className="text-xs text-muted-foreground mb-1 block">Año</label>
-                    <input
-                      type="text"
-                      placeholder="2025"
-                      value={cardForm.expYear}
-                      onChange={(e) => setCardForm({ ...cardForm, expYear: e.target.value })}
-                      className="w-full h-11 px-3 rounded-lg border border-border bg-background text-sm focus:outline-none focus:ring-1 focus:ring-primary"
-                      maxLength={4}
-                    />
-                  </div>
-                  <div>
-                    <label className="text-xs text-muted-foreground mb-1 block">CVV</label>
-                    <input
-                      type="text"
-                      placeholder="123"
-                      value={cardForm.cvv}
-                      onChange={(e) => setCardForm({ ...cardForm, cvv: e.target.value })}
-                      className="w-full h-11 px-3 rounded-lg border border-border bg-background text-sm focus:outline-none focus:ring-1 focus:ring-primary"
-                      maxLength={4}
-                    />
-                  </div>
-                </div>
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="text-xs text-muted-foreground mb-1 block">Tipo de documento</label>
-                    <select
-                      value={cardForm.docType}
-                      onChange={(e) => setCardForm({ ...cardForm, docType: e.target.value })}
-                      className="w-full h-11 px-3 rounded-lg border border-border bg-background text-sm focus:outline-none focus:ring-1 focus:ring-primary"
-                    >
-                      <option value="DNI">DNI</option>
-                      <option value="CI">CI</option>
-                      <option value="LC">LC</option>
-                      <option value="LE">LE</option>
-                      <option value="Otro">Otro</option>
-                    </select>
-                  </div>
-                  <div>
-                    <label className="text-xs text-muted-foreground mb-1 block">Número de documento</label>
-                    <input
-                      type="text"
-                      placeholder="12345678"
-                      value={cardForm.docNumber}
-                      onChange={(e) => setCardForm({ ...cardForm, docNumber: e.target.value })}
-                      className="w-full h-11 px-3 rounded-lg border border-border bg-background text-sm focus:outline-none focus:ring-1 focus:ring-primary"
-                    />
-                  </div>
-                </div>
-                {cardError && (
+                <button
+                  onClick={detectLocation}
+                  disabled={locationLoading}
+                  className="w-full h-14 rounded-lg border-2 border-dashed border-border hover:border-primary/50 bg-muted/30 flex items-center justify-center gap-3 transition-colors disabled:opacity-60"
+                >
+                  {locationLoading ? (
+                    <>
+                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="animate-spin text-primary">
+                        <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+                      </svg>
+                      <span className="text-sm text-muted-foreground">Detectando ubicacion...</span>
+                    </>
+                  ) : (
+                    <>
+                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-primary">
+                        <circle cx="12" cy="12" r="10" />
+                        <line x1="12" y1="8" x2="12" y2="12" />
+                        <line x1="12" y1="16" x2="12.01" y2="16" />
+                      </svg>
+                      <span className="text-sm font-medium">Detectar mi ubicacion</span>
+                    </>
+                  )}
+                </button>
+
+                {locationError && (
                   <p className="text-xs text-destructive bg-destructive/10 border border-destructive/20 rounded-lg px-3 py-2">
-                    {cardError}
+                    {locationError}
                   </p>
                 )}
+
+                <div className="relative">
+                  <div className="absolute inset-0 flex items-center">
+                    <div className="w-full border-t border-border" />
+                  </div>
+                  <div className="relative flex justify-center">
+                    <span className="bg-background px-3 text-xs text-muted-foreground">o escribila</span>
+                  </div>
+                </div>
+
+                <input
+                  type="text"
+                  placeholder="Ej: Av. Javier Prado 1234, Lima"
+                  value={locationAddress}
+                  onChange={(e) => {
+                    setLocationAddress(e.target.value);
+                    if (e.target.value.trim()) setLocationCoords({ lat: 0, lng: 0 });
+                    else setLocationCoords(null);
+                  }}
+                  className="w-full h-11 px-3 rounded-lg border border-border bg-background text-sm focus:outline-none focus:ring-1 focus:ring-primary"
+                />
               </div>
             )}
 
-            {cardSaved ? (
-              <button
-                onClick={() => setStep("ready")}
-                className="w-full h-11 bg-foreground text-background rounded-lg text-sm font-medium hover:bg-foreground/90 transition-colors"
-              >
-                Continuar
-              </button>
-            ) : (
+            {locationCoords ? (
               <div className="space-y-3">
                 <button
-                  onClick={handleSaveCard}
-                  disabled={cardLoading || !cardForm.number || !cardForm.name || !cardForm.cvv}
-                  className="w-full h-11 bg-[#009ee3] text-white rounded-lg text-sm font-medium hover:bg-[#007eb8] transition-colors disabled:opacity-40"
+                  onClick={() => setStep("ready")}
+                  className="w-full h-11 bg-foreground text-background rounded-lg text-sm font-medium hover:bg-foreground/90 transition-colors"
                 >
-                  {cardLoading ? "Guardando..." : "Guardar tarjeta"}
+                  Continuar
                 </button>
                 <button
-                  onClick={() => setStep("ready")}
+                  onClick={() => { setLocationCoords(null); setLocationAddress(""); }}
                   className="w-full h-11 text-muted-foreground text-sm hover:text-foreground transition-colors"
                 >
-                  Omitir por ahora
+                  Cambiar ubicacion
                 </button>
               </div>
+            ) : (
+              <button
+                onClick={() => setStep("ready")}
+                className="w-full h-11 text-muted-foreground text-sm hover:text-foreground transition-colors mt-2"
+              >
+                Omitir por ahora
+              </button>
             )}
           </div>
         )}
@@ -404,13 +339,13 @@ export default function OnboardingPage() {
         {step === "ready" && (
           <div className="text-center">
             <div className="w-16 h-16 rounded-full bg-accent mx-auto mb-6 flex items-center justify-center">
-              <span className="text-accent-foreground text-2xl font-bold">✓</span>
+              <span className="text-accent-foreground text-2xl font-bold">&#10003;</span>
             </div>
             <h1 className="text-3xl mb-2 tracking-tight" style={{ fontFamily: "var(--font-heading)", fontStyle: "italic" }}>
               Todo listo
             </h1>
             <p className="text-muted-foreground text-sm mb-8 max-w-xs mx-auto">
-              Tu cuenta está configurada. Explorá productos o hablá con tu agente para empezar a comprar o vender.
+              Tu cuenta esta configurada. Explora productos o habla con tu agente para empezar a comprar o vender.
             </p>
             <div className="space-y-3">
               <button
@@ -433,12 +368,12 @@ export default function OnboardingPage() {
         {step !== "country" && step !== "ready" && (
           <button
             onClick={() => {
-              if (step === "card") setStep("mercadopago");
+              if (step === "location") setStep("mercadopago");
               else if (step === "mercadopago") setStep("country");
             }}
             className="mt-4 text-sm text-muted-foreground hover:text-foreground transition-colors mx-auto block"
           >
-            ← Volver
+            &#8592; Volver
           </button>
         )}
       </div>
